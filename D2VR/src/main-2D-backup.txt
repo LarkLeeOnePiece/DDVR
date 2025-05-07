@@ -1,0 +1,293 @@
+﻿#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#include <iostream>
+#include <fstream>
+#include <cmath>
+#include <vector>
+#include <cuda_runtime.h>
+#include <cufft.h>
+#include <iomanip> // 注意需要包含这个头文件
+
+#define PI 3.14159265358979323846f
+
+
+__global__ void backproject_kernel(
+    const double* sino,
+    const double* angles,
+    double* recon,
+    int n,
+    int n_angles
+) {
+    int x = blockDim.x * blockIdx.x + threadIdx.x;
+    int y = blockDim.y * blockIdx.y + threadIdx.y;
+
+    if (x >= n || y >= n) return;
+
+    double cx = n / 2.0f;
+    double cy = n / 2.0f;
+    double acc = 0.0f;
+
+    for (int i = 0; i < n_angles; ++i) {
+        double theta = angles[i] * PI / 180.0f;
+        double s = (x - cx) * cos(theta) + (y - cy) * sin(theta) + cx;
+        //s = fminf(fmaxf(s, 0.0f), n - 1.0f); // 裁剪到 [0, n-1]
+
+        int si = (int)floorf(s);
+        double ds = s - si;
+
+        if (si >= 0 && si <= n-1) {
+
+            if (si >= 0 && si < n - 1) {
+                float val = sino[i + si * n_angles] * (1.0f - ds) + sino[i + (si + 1) * n_angles] * ds;
+                acc += val;
+            }
+            else if (si == n - 1) {
+                acc += sino[i + si * n_angles]; // 使用边界值，不插值
+            }
+
+
+            ////double val = sino[si + i * n] * (1.0f - ds) + sino[si + 1 + i * n] * ds;
+            //int index1 = si * n_angles + i;
+            //int index2 = (si + 1) * n_angles + i;
+            //double val = sino[index1] * (1.0f - ds) + sino[index2] * ds;
+
+            ////double val = sino[i + si * n_angles] * (1.0f - ds) + sino[i + (si+1) * n_angles] * ds;
+            //acc += val;
+        }
+        else if (si < 0) {
+            acc += sino[i + 0 * n_angles]; // 使用边界值，不插值
+        }
+        else if (si > n-1) {
+            acc += sino[i + n-1 * n_angles]; // 使用边界值，不插值
+        }
+    }
+
+    recon[y * n + x] = acc / n_angles*PI;
+}
+
+void read_sinogram(const std::string& filename, std::vector<double>& sino, int& n, int& n_angles) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "Failed to open file: " << filename << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    in.read((char*)&n, sizeof(int));
+    in.read((char*)&n_angles, sizeof(int));
+
+    std::cout << "[Debug] Read n = " << n << ", n_angles = " << n_angles << std::endl;
+
+    sino.resize(n * n_angles);
+    in.read((char*)sino.data(), n * n_angles * sizeof(double));
+    in.close();
+}
+
+void write_image(const std::string& filename, const std::vector<double>& image, int n) {
+    std::ofstream out(filename, std::ios::binary);
+    out.write((char*)&n, sizeof(int));
+    out.write((char*)image.data(), n * n * sizeof(double));
+    out.close();
+}
+
+
+// CUDA 内核：对所有数据点在频域上应用滤波核
+__global__
+void apply_filter(cufftComplex* data, const double* filter, int n, int n_angles) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * n_angles;
+    if (idx < total) {
+        int k = idx % n; // 对应频率索引
+        double f = filter[k];
+        data[idx].x *= f;
+        data[idx].y *= f;
+    }
+}
+
+// 错误检查函数
+void checkCudaError(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Error: " << msg << " : " << cudaGetErrorString(err) << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+void checkCufftError(cufftResult res, const char* msg) {
+    if (res != CUFFT_SUCCESS) {
+        std::cerr << "cuFFT Error: " << msg << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
+// 改进后的 Ram-Lak 滤波函数
+// 输入 sinogram 为长度为 n*n_angles 的一维向量，数据按列排列（每列对应一个投影）
+// 滤波过程：先对每一列做 FFT，然后乘以滤波核，再做逆 FFT，最后只保留实部并归一化
+void ram_lak_filter(std::vector<double>& sinogram, int n, int n_angles) {
+    int total = n * n_angles;
+
+    // 1. 生成滤波核，逻辑与 numpy.fft.fftfreq 保持一致：
+    // 对于 k=0,...,n/2：f = k/n， 对于 k > n/2：f = (n-k)/n，然后滤波核 = 2 * f
+    std::vector<double> h_filter(n);
+    for (int k = 0; k < n; k++) {
+        double f;
+        if (k <= n / 2)
+            f = static_cast<double>(k) / n;
+        else
+            f = static_cast<double>(n - k) / n;
+        h_filter[k] = 2.0f * fabs(f);
+    }
+    std::cout << "h_filter" << h_filter[0]<<',' << h_filter[1] << ',' << h_filter[2] << std::endl;
+    // 2. 将滤波核复制到设备内存
+    double* d_filter;
+    checkCudaError(cudaMalloc((void**)&d_filter, sizeof(double) * n), "cudaMalloc d_filter");
+    checkCudaError(cudaMemcpy(d_filter, h_filter.data(), sizeof(double) * n, cudaMemcpyHostToDevice), "cudaMemcpy d_filter");
+
+    // 3. 分配设备内存用于存储复数 sinogram 数据（每个投影长度 n，共 n_angles 个）
+    cufftComplex* d_data;
+    checkCudaError(cudaMalloc((void**)&d_data, sizeof(cufftComplex) * total), "cudaMalloc d_data");
+
+    // 4. 将输入 sinogram 转换为复数格式（实部为输入数据，虚部置 0），复制到设备
+    std::vector<cufftComplex> h_data(total);
+    for (int i = 0; i < total; i++) {
+        h_data[i].x = sinogram[i];
+        h_data[i].y = 0.0f;
+    }
+    checkCudaError(cudaMemcpy(d_data, h_data.data(), sizeof(cufftComplex) * total, cudaMemcpyHostToDevice), "cudaMemcpy to d_data");
+
+    // 5. 创建批处理 FFT 计划，针对每一列做一维 FFT
+    cufftHandle plan;
+    int rank = 1;             // 一维 FFT
+    int n_dims[1] = { n };    // 每个 FFT 的大小
+    int inembed[1] = { n };
+    int istride = 1;
+    int idist = n;
+    int onembed[1] = { n };
+    int ostride = 1;
+    int odist = n;
+    int batch = n_angles;
+    checkCufftError(cufftPlanMany(&plan, rank, n_dims,
+        inembed, istride, idist,
+        onembed, ostride, odist,
+        CUFFT_C2C, batch), "cufftPlanMany");
+
+    // 6. 执行正 FFT（沿每一列）
+    checkCufftError(cufftExecC2C(plan, d_data, d_data, CUFFT_FORWARD), "cufftExecC2C FORWARD");
+
+    // 7. 在设备端对所有 FFT 结果乘以滤波核
+    int threadsPerBlock = 256;
+    int blocks = (total + threadsPerBlock - 1) / threadsPerBlock;
+    apply_filter << <blocks, threadsPerBlock >> > (d_data, d_filter, n, n_angles);
+    cudaDeviceSynchronize();
+
+    // 8. 执行逆 FFT
+    checkCufftError(cufftExecC2C(plan, d_data, d_data, CUFFT_INVERSE), "cufftExecC2C INVERSE");
+
+    // 9. 将处理后的数据复制回主机
+    checkCudaError(cudaMemcpy(h_data.data(), d_data, sizeof(cufftComplex) * total, cudaMemcpyDeviceToHost), "cudaMemcpy d_data to host");
+
+    // 10. 归一化并更新 sinogram（只保留归一化后的实部）
+    for (int i = 0; i < total; i++) {
+        sinogram[i] = h_data[i].x / n;
+    }
+
+    // 11. 清理资源
+    cufftDestroy(plan);
+    cudaFree(d_data);
+    cudaFree(d_filter);
+}
+
+
+//void ram_lak_filter(std::vector<double>& sino, int n, int n_angles) {
+//    std::vector<double> freq(n);
+//    int half = n / 2;
+//
+//    for (int i = 0; i < n; ++i) {
+//        int shifted_i = (i + n / 2) % n; // ifftshift
+//        double f = (double)(i - n / 2) / n;
+//        freq[shifted_i] = 2.0f * fabs(f);  // Or multiply by PI
+//    }
+//
+//
+//    cufftHandle plan;
+//    cufftPlan1d(&plan, n, CUFFT_C2C, 1);
+//    cufftComplex* d_data;
+//    cudaMalloc(&d_data, sizeof(cufftComplex) * n);
+//
+//    for (int i = 0; i < n_angles; ++i) {
+//        std::vector<cufftComplex> spectrum(n);
+//        for (int j = 0; j < n; ++j) {
+//            spectrum[j].x = sino[j + i * n];
+//            spectrum[j].y = 0;
+//        }
+//
+//        cudaMemcpy(d_data, spectrum.data(), sizeof(cufftComplex) * n, cudaMemcpyHostToDevice);
+//        cufftExecC2C(plan, d_data, d_data, CUFFT_FORWARD);
+//        cudaMemcpy(spectrum.data(), d_data, sizeof(cufftComplex) * n, cudaMemcpyDeviceToHost);
+//
+//        for (int j = 0; j < n; ++j) {
+//            spectrum[j].x *= freq[j];
+//            spectrum[j].y *= freq[j];
+//        }
+//
+//        cudaMemcpy(d_data, spectrum.data(), sizeof(cufftComplex) * n, cudaMemcpyHostToDevice);
+//        cufftExecC2C(plan, d_data, d_data, CUFFT_INVERSE);
+//        cudaMemcpy(spectrum.data(), d_data, sizeof(cufftComplex) * n, cudaMemcpyDeviceToHost);
+//
+//        for (int j = 0; j < n; ++j) {
+//            sino[j + i * n] = spectrum[j].x / n; // normalize
+//        }
+//    }
+//
+//    cufftDestroy(plan);
+//    cudaFree(d_data);
+//}
+
+void write_matrix(const std::string& filename, const double* data, int rows, int cols) {
+    std::ofstream out(filename, std::ios::binary);
+    out.write((char*)&rows, sizeof(int));
+    out.write((char*)&cols, sizeof(int));
+    out.write((char*)data, sizeof(double) * rows * cols);
+    out.close();
+}
+
+int main() {
+    int n, n_angles;
+    std::vector<double> sino_host;
+    read_sinogram("../data/filtered_sinogram.bin", sino_host, n, n_angles);
+    std::cout << "Read Sinogram" << std::endl;
+    std::cout << std::fixed << std::setprecision(8);  // 保留6位小数
+    std::cout << "Sinogram first line:" << sino_host[0]<<','<< sino_host[1]<< sino_host[2]<< std::endl;
+    std::cout << "Sinogram second line:" << sino_host[0+ n_angles] << ',' << sino_host[1+ n_angles] << sino_host[2+ n_angles] << std::endl;
+    //ram_lak_filter(sino_host, n, n_angles);
+    std::cout << "Filtered with Ram-Lak" << std::endl;
+    write_matrix("filtered_sinogram.bin", sino_host.data(), n, n_angles);
+    double* sino_gpu;
+    double* angles_gpu;
+    double* recon_gpu;
+    std::vector<double> angles_host(n_angles);
+    for (int i = 0; i < n_angles; ++i)
+        angles_host[i] = i * 180.0f / n_angles;
+
+    cudaMalloc(&sino_gpu, sizeof(double) * n * n_angles);
+    cudaMalloc(&angles_gpu, sizeof(double) * n_angles);
+    cudaMalloc(&recon_gpu, sizeof(double) * n * n);
+
+    cudaMemcpy(sino_gpu, sino_host.data(), sizeof(double) * n * n_angles, cudaMemcpyHostToDevice);
+    cudaMemcpy(angles_gpu, angles_host.data(), sizeof(double) * n_angles, cudaMemcpyHostToDevice);
+
+    dim3 threads(16, 16);
+    dim3 blocks((n + 15) / 16, (n + 15) / 16);
+    backproject_kernel <<<blocks, threads >> > (sino_gpu, angles_gpu, recon_gpu, n, n_angles);
+    cudaDeviceSynchronize();
+
+    std::vector<double> recon_host(n * n);
+    cudaMemcpy(recon_host.data(), recon_gpu, sizeof(double) * n * n, cudaMemcpyDeviceToHost);
+
+    write_image("reconstruction.bin", recon_host, n);
+
+    cudaFree(sino_gpu);
+    cudaFree(angles_gpu);
+    cudaFree(recon_gpu);
+
+    std::cout << "Reconstruction complete.\n";
+    return 0;
+}
