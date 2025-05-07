@@ -19,3 +19,6 @@ you can get dataset from [Clean Implicit 3D Structure from Noisy 2D STEM Images]
 
 ## Some visual result
 
+This is one result showing the comparison between DVR and D2VR with AO
+
+![Comparison](./assets/comparison_with_error.gif "Magic Gardens")
