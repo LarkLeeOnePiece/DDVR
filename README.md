@@ -19,6 +19,32 @@ you can get dataset from [Clean Implicit 3D Structure from Noisy 2D STEM Images]
 
 ## Some visual result
 
+### Render UI
+We implment the interaction UI based on pygame
+![Comparison](./assets/renderUI.gif "Magic Gardens")
+
+### FBP reconstruction result
+
+For the dataset, we used four dataset from  [Clean Implicit 3D Structure from Noisy 2D STEM Images](https://github.com/HannahKniesel/Implicit-Electron-Tomography)
+
+1. Synthetic data with noise
+
+![fbp](./assets/Syn_Noisy_wAO_vol_512x512x512.gif)
+
+
+2. Synthetic data without noise
+
+![fbp](./assets/Syn_Clean_wAO_vol_512x512x512.gif)
+
+3. Real nanoparticles
+
+![fbp](./assets/Real_NanoParticles_wAO_vol_512x512x512.gif)
+
+4. Read covid infected cell
+
+![fbp](./assets/Real_Denoised_BM3D_wAO_vol_512x512x512.gif)
+
+### Some render result
 This is one result showing the comparison between DVR and D2VR with AO
 
 ![Comparison](./assets/comparison_with_error.gif "Magic Gardens")
